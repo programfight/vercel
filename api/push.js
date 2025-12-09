@@ -28,9 +28,8 @@ module.exports = async (req, res) => {
   }
 
   const apiKey = req.headers["x-api-key"];
-  console.log("x-api-key present:", !!apiKey, "type:", Array.isArray(apiKey) ? "array" : typeof apiKey);
   if (!apiKey || apiKey !== process.env.API_KEY) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized " + "x-api-key present:" + !!apiKey + ", type:" + (Array.isArray(apiKey) ? "array" : typeof apiKey) });
   }
 
   try {
