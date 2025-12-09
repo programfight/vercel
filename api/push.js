@@ -1,17 +1,31 @@
-// api/push.js (Vercel)
-import admin from "firebase-admin";
+// api/push.js
+const admin = require("firebase-admin");
 
-const svc = process.env.FIREBASE_SERVICE_ACCOUNT;
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(svc)),
-  });
+function ensureAdmin() {
+  if (!admin.apps.length) {
+    const svc = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (!svc) throw new Error("FIREBASE_SERVICE_ACCOUNT missing");
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(svc)) });
+  }
 }
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+module.exports = async (req, res) => {
+  try {
+    ensureAdmin();
+  } catch (e) {
+    console.error("init error:", e);
+    return res.status(500).json({ error: "Init failed: " + String(e) });
+  }
 
-  // Sécurité simple: clé partagée (tu peux aussi vérifier un ID token Firebase)
+  if (req.method === "GET") {
+    // Réponse simple pour vérifier que la fonction est vivante
+    return res.status(200).json({ ok: true, hint: "Use POST with JSON body." });
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
   const apiKey = req.headers["x-api-key"];
   if (!apiKey || apiKey !== process.env.API_KEY) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -24,11 +38,7 @@ export default async function handler(req, res) {
     const payload = {
       token: toToken,
       notification: { title: "Nouveau message", body },
-      data: {
-        type: "new_message",
-        partnerId: partnerId || "",
-        chatId: chatId || "",
-      },
+      data: { type: "new_message", partnerId: partnerId || "", chatId: chatId || "" },
       apns: {
         headers: { "apns-collapse-id": chatId || "chat" },
         payload: {
@@ -41,10 +51,10 @@ export default async function handler(req, res) {
       },
     };
 
-    const resp = await admin.messaging().send(payload);
-    return res.status(200).json({ ok: true, id: resp });
+    const id = await admin.messaging().send(payload);
+    return res.status(200).json({ ok: true, id });
   } catch (e) {
     console.error("push error:", e);
     return res.status(500).json({ error: String(e) });
   }
-}
+};
