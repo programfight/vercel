@@ -1,4 +1,4 @@
-// api/push.js
+/* eslint-disable quotes, max-len, indent, operator-linebreak, object-curly-spacing, comma-dangle, quote-props */
 const admin = require("firebase-admin");
 
 function ensureAdmin() {
@@ -12,6 +12,62 @@ function ensureAdmin() {
   }
 }
 
+async function verifyFirebaseIdToken(req) {
+  const auth = req.headers?.authorization || req.headers?.Authorization || "";
+  const m = typeof auth === "string" ? auth.match(/^Bearer (.+)$/i) : null;
+  if (!m) {
+    const hasKey = !!req.headers?.["x-api-key"];
+    throw Object.assign(new Error("missing_authorization_bearer"), { status: 401, hasKey });
+  }
+  const idToken = m[1];
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    return decoded; // { uid, ... }
+  } catch (e) {
+    throw Object.assign(new Error("invalid_id_token"), { status: 401, details: e?.message });
+  }
+}
+
+// Firestore helpers
+const db = () => admin.firestore();
+
+async function getUserTokens(uid) {
+  const snap = await db().collection("users").doc(uid).get();
+  if (!snap.exists) return [];
+  const arr = Array.isArray(snap.get("fcmTokens")) ? snap.get("fcmTokens") : [];
+  const single = snap.get("fcmToken");
+  const tokens = [...arr];
+  if (single && !tokens.includes(single)) tokens.push(single);
+  return tokens.filter(t => typeof t === "string" && t.trim().length > 0);
+}
+
+async function removeInvalidTokens(uid, invalidTokens) {
+  if (!invalidTokens.length) return;
+  const userRef = db().collection("users").doc(uid);
+  await db().runTransaction(async (tx) => {
+    const doc = await tx.get(userRef);
+    if (!doc.exists) return;
+    const arr = Array.isArray(doc.get("fcmTokens")) ? doc.get("fcmTokens") : [];
+    const single = doc.get("fcmToken");
+    const newArray = arr.filter(t => !invalidTokens.includes(t));
+    const update = { fcmTokens: newArray };
+    if (single && invalidTokens.includes(single)) {
+      update.fcmToken = admin.firestore.FieldValue.delete();
+    }
+    tx.set(userRef, update, { merge: true });
+  });
+}
+
+async function shouldSkipPushIfViewingChat(toUid, fromUid) {
+  const snap = await db().collection("chatPresence").doc(toUid).get();
+  if (!snap.exists) return false;
+  return snap.get("viewingChatWith") === fromUid;
+}
+
+function safeChatId(input) {
+  return String(input || "chat").replace(/[<>]/g, "");
+}
+
 module.exports = async (req, res) => {
   try {
     ensureAdmin();
@@ -21,15 +77,19 @@ module.exports = async (req, res) => {
   }
 
   if (req.method === "GET") {
-    return res.status(200).json({ ok: true, hint: "Use POST with JSON body." });
+    return res.status(200).json({ ok: true, hint: "Use POST with JSON body and Authorization: Bearer <ID token>." });
   }
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const apiKey = req.headers["x-api-key"];
-  if (!apiKey || apiKey !== process.env.API_KEY) {
-    return res.status(401).json({ error: "Unauthorized " + "x-api-key present:" + !!apiKey + ", type:" + (Array.isArray(apiKey) ? "array" : typeof apiKey) });
+  // Auth via Firebase ID token
+  let authUser;
+  try {
+    authUser = await verifyFirebaseIdToken(req);
+  } catch (e) {
+    const status = e.status || 401;
+    return res.status(status).json({ error: e.message, details: e.details, hasXApiKey: e.hasKey });
   }
 
   try {
@@ -39,46 +99,108 @@ module.exports = async (req, res) => {
       try { bodyObj = JSON.parse(bodyObj); } catch {}
     }
 
-    const { toToken, body, partnerId, chatId } = bodyObj || {};
-    if (!toToken || !body) {
-      return res.status(400).json({ error: "Missing toToken/body" });
+    // Entrées attendues (parité avec ta Function): partnerId, chatId, kind, text?, notificationTitle?, apns?
+    const {
+      partnerId,
+      chatId,
+      kind,
+      text,
+      notificationTitle,
+      apns
+    } = bodyObj || {};
+
+    if (!partnerId || !chatId || !kind) {
+      return res.status(400).json({ error: "Missing required fields", required: ["partnerId", "chatId", "kind"] });
     }
 
-    // Eviter les chevrons dans chatId
-    const safeChatId = (chatId || "chat").replace(/[<>]/g, "");
+    // Option: skip si le destinataire regarde déjà ce chat
+    const skip = await shouldSkipPushIfViewingChat(partnerId, authUser.uid);
+    if (skip) {
+      return res.status(200).json({ skipped: true, reason: "recipient_viewing_chat" });
+    }
 
+    // Résolution des tokens
+    const tokens = await getUserTokens(partnerId);
+    if (!tokens.length) {
+      return res.status(200).json({ skipped: true, reason: "no_tokens" });
+    }
+
+    // Corps lisible selon le type (parité)
+    const body =
+      kind === "image" ? "📷 Photo" :
+      kind === "location" ? "📍 Localisation" :
+      (typeof text === "string" && text.trim().length > 0 ? text : "Nouveau message");
+
+    const title = typeof notificationTitle === "string" && notificationTitle.trim().length > 0
+      ? notificationTitle
+      : "Nouveau message";
+
+    const safeId = safeChatId(chatId);
+
+    // Multicast payload
     const payload = {
-      token: toToken,
-      notification: { title: "Nouveau message", body },
+      tokens,
+      notification: { title, body },
       data: {
         type: "new_message",
-        partnerId: partnerId || "",
-        chatId: safeChatId,
+        partnerId: authUser.uid || "",
+        chatId: safeId
       },
       apns: {
         headers: {
-          "apns-collapse-id": safeChatId,
-          "apns-push-type": "alert",
-          "apns-priority": "10"
+          "apns-collapse-id": safeId,
+          ...(apns?.headers || {})
         },
         payload: {
           aps: {
-            alert: { title: "Nouveau message", body },
+            alert: { title, body },
             sound: "default",
-            "thread-id": safeChatId
-          }
+            "thread-id": safeId,
+            ...(apns?.payload?.aps || {})
+          },
+          ...(apns?.payload ? { ...apns.payload, aps: undefined } : {})
         }
       }
     };
 
-    // Option: dry run pour valider côté FCM sans envoyer
-    // const id = await admin.messaging().send(payload, true);
+    // Envoi multicast
+    const resp = await admin.messaging().sendEachForMulticast(payload);
 
-    const id = await admin.messaging().send(payload);
-    console.log("✅ FCM sent:", id);
-    return res.status(200).json({ ok: true, id });
+    // Tokens invalides à nettoyer
+    const invalidTokens = [];
+    resp.responses.forEach((r, idx) => {
+      if (!r.success && r.error) {
+        const code = r.error.code || "";
+        if (
+          /registration-token-not-registered/i.test(code) ||
+          /invalid-registration-token/i.test(code) ||
+          /unregistered/i.test(code)
+        ) {
+          invalidTokens.push(tokens[idx]);
+        }
+      }
+    });
+
+    if (invalidTokens.length) {
+      try {
+        await removeInvalidTokens(partnerId, invalidTokens);
+      } catch (cleanErr) {
+        console.warn("Failed to clean invalid tokens:", cleanErr);
+      }
+    }
+
+    return res.status(200).json({
+      ok: true,
+      successCount: resp.successCount,
+      failureCount: resp.failureCount,
+      invalidatedTokens: invalidTokens,
+      results: resp.responses.map((r, idx) => ({
+        token: tokens[idx],
+        success: r.success,
+        error: r.error ? { code: r.error.code, message: r.error.message } : undefined
+      }))
+    });
   } catch (e) {
-    // Erreurs Messaging typiques: e.code = 'messaging/registration-token-not-registered', etc.
     const err = {
       code: e.code,
       message: e.message,
