@@ -68,6 +68,26 @@ function safeChatId(input) {
   return String(input || "chat").replace(/[<>]/g, "");
 }
 
+async function computeUnreadCountForRecipient(chatId, fromUid, toUid) {
+  // On compte les messages envoyés par fromUid non lus par toUid
+  // Limite: on scanne les N derniers (500) et on filtre localement readBy !contains toUid
+  const ref = db().collection("chats").doc(chatId).collection("messages");
+  const qs = await ref
+    .where("senderId", "==", fromUid)
+    .orderBy("timestamp", "desc")
+    .limit(500)
+    .get();
+
+  let count = 0;
+  qs.docs.forEach(doc => {
+    const data = doc.data() || {};
+    if (data.deleted === true) return;
+    const readBy = Array.isArray(data.readBy) ? data.readBy : [];
+    if (!readBy.includes(toUid)) count++;
+  });
+  return count;
+}
+
 module.exports = async (req, res) => {
   try {
     ensureAdmin();
@@ -136,7 +156,14 @@ module.exports = async (req, res) => {
       : "Nouveau message";
 
     const safeId = safeChatId(chatId);
-
+    
+    let unreadCount = 0;
+    try {
+      unreadCount = await computeUnreadCountForRecipient(safeId, authUser.uid, partnerId);
+    } catch (e) {
+      console.warn("Failed to compute unreadCount:", e?.message || e);
+    }
+    
     // Multicast payload
     const payload = {
       tokens,
@@ -156,6 +183,7 @@ module.exports = async (req, res) => {
             alert: { title, body },
             sound: "default",
             "thread-id": safeId,
+            badge: unreadCount, // 👈 badge absolu
             ...(apns?.payload?.aps || {})
           },
           ...(apns?.payload ? { ...apns.payload, aps: undefined } : {})
